@@ -1,0 +1,41 @@
+# Local development: PostgreSQL 18 and a Keycloak with a development realm.
+#   docker compose -f compose.dev.yaml up -d
+# Keycloak: http://localhost:8096 (admin / admin), realm "support-agent", test
+# users with the password "support-agent-dev": ada@example.org (admin through
+# ADMIN_EMAILS in .env.example), eddie@example.org and olga@example.org (no
+# access until an admin adds them).
+# The production setup is compose.yaml.
+name: support-agent-dev
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: support_agent
+      POSTGRES_PASSWORD: support_agent
+      POSTGRES_DB: support_agent
+    ports:
+      - "127.0.0.1:55436:5432"
+    volumes:
+      - postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U support_agent -d support_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8.2-3
+    command: ["start-dev", "--import-realm", "--http-port=8080"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      # The image sizes the heap from host RAM (up to 70 %); cap it for local use.
+      JAVA_OPTS_KC_HEAP: "-Xms64m -Xmx512m"
+    ports:
+      - "127.0.0.1:8096:8080"
+    volumes:
+      - ./dev/keycloak:/opt/keycloak/data/import:ro
+
+volumes:
+  postgres:

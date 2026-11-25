@@ -1,0 +1,95 @@
+# Production on a Linux server (Debian, Ubuntu) with Docker Compose: the
+# image as two processes, the admin interface (`web`) and the Slack bot
+# (`bot`), after a one-off migration. The bot keeps answering when the admin
+# interface is down or being deployed. Settings live in .env next to this file
+# (docs/configuration.md). Start it with:
+#
+#   docker compose up -d --pull always
+#
+# SUPPORT_AGENT_IMAGE_TAG in .env selects the image of
+# ghcr.io/projecttogether/support-agent: latest (the newest commit on main, the
+# default) or sha-<commit> for one build. To upgrade, run the same command
+# again: it pulls the newer image.
+#
+# Without a PostgreSQL of your own, add compose.postgres.yaml
+# (COMPOSE_FILE=compose.yaml:compose.postgres.yaml in .env).
+#
+# `web` listens on 127.0.0.1:3000 (SUPPORT_AGENT_PORT changes the host port),
+# for a reverse proxy on the same server, such as Caddy, that terminates
+# HTTPS; set APP_URL to its public https URL. The bot needs no public
+# address: it connects to Slack. Back up the database.
+
+x-image: &image ghcr.io/projecttogether/support-agent:${SUPPORT_AGENT_IMAGE_TAG:-latest}
+
+# Every variable in .env reaches the containers (docs/configuration.md); the
+# required ones are checked here so a missing value stops the start.
+x-app-environment: &app-environment
+  DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+  APP_URL: ${APP_URL:?Set APP_URL}
+  AUTH_SECRET: ${AUTH_SECRET:?Set AUTH_SECRET}
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY}
+  OIDC_ISSUER: ${OIDC_ISSUER:?Set OIDC_ISSUER}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?Set OIDC_CLIENT_ID}
+  OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?Set OIDC_CLIENT_SECRET}
+  # The reverse proxy in front of the app sets X-Forwarded-For.
+  TRUST_PROXY: ${TRUST_PROXY:-true}
+
+x-app: &app
+  image: *image
+  env_file:
+    - path: .env
+      required: false
+  environment: *app-environment
+
+services:
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    restart: "no"
+
+  web:
+    <<: *app
+    command: ["web"]
+    restart: unless-stopped
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      # Only on the server itself, for the reverse proxy. SUPPORT_AGENT_PORT
+      # picks another host port when 3000 is taken, e.g. by another app.
+      - "127.0.0.1:${SUPPORT_AGENT_PORT:-3000}:3000"
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/-/readyz').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  bot:
+    <<: *app
+    command: ["bot"]
+    # The bot exits when Slack stays unreachable (BOT_WATCHDOG_SECONDS); the
+    # restart policy starts a fresh process.
+    restart: unless-stopped
+    # A stop (a deploy) gives the answers in progress 45 seconds to finish;
+    # the next start resumes what a stop cut short (docs/architecture.md,
+    # Restarts and deploys).
+    stop_grace_period: 1m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # Healthy while connected to Slack, or while Slack is not set up yet.
+      test:
+        - CMD
+        - node
+        - -e
+        - "const s = require('node:fs').statSync('/tmp/bot-heartbeat', { throwIfNoEntry: false }); process.exit(s && Date.now() - s.mtimeMs < 90000 ? 0 : 1)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s

@@ -1,0 +1,179 @@
+name: Deploy
+
+# After CI passes on main: build the app's image, push it to GitHub's container
+# registry, and deploy it to the server of the environment production
+# (docs/deployment.md, Builds and deploys). "Run workflow" deploys the current
+# main again, for example after changing a setting in the environment
+# production. Without the variable DEPLOY_HOST in that environment, the
+# workflow only builds and pushes the image.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+# One deploy at a time; the others wait in order (queue: max, up to 100), so a run for
+# an older commit cannot push a waiting deploy of main's newest out. It finds out
+# that it is not the newest and deploys nothing. Runs that will not deploy (failed or
+# cancelled checks) get a group of their own.
+concurrency:
+  group: >-
+    ${{ (github.ref == 'refs/heads/main' &&
+    (github.event_name == 'workflow_dispatch' ||
+    (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')))
+    && 'deploy-production' || format('deploy-skipped-{0}', github.run_id) }}
+  cancel-in-progress: false
+  queue: max
+
+env:
+  IMAGE: ghcr.io/projecttogether/support-agent
+  # Builds upload their source maps to this Sentry project when the secret
+  # SENTRY_AUTH_TOKEN (an organization token) is set.
+  SENTRY_ORG: projecttogether
+  SENTRY_PROJECT: support-agent
+
+jobs:
+  image:
+    name: Build and push the image
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read # find the CI run of the commit
+      contents: read
+      packages: write
+    outputs:
+      # Empty when the commit is not main's newest: the deploy job then does nothing.
+      image: ${{ steps.check.outputs.newest == 'true' && steps.tag.outputs.image || '' }}
+    env:
+      SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+    steps:
+      - id: tag
+        run: echo "image=$IMAGE:sha-$SHA" >> "$GITHUB_OUTPUT"
+      # Only main's newest commit, and only after CI passed for it: a rerun of an older
+      # CI run must not take :latest and the server back, and "Run workflow" must not
+      # deploy a commit whose checks are still running or failed.
+      - name: Check that the commit is main's newest and passed CI
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          newest=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$SHA" != "$newest" ]; then
+            echo "::notice::$SHA is no longer the newest commit on main ($newest): nothing to deploy."
+            echo "newest=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          passed=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yaml/runs?head_sha=$SHA&status=success" --jq .total_count)
+          if [ "$passed" -eq 0 ]; then
+            echo "::error::CI has not passed for $SHA (yet); the deploy starts by itself once it does."
+            exit 1
+          fi
+          echo "newest=true" >> "$GITHUB_OUTPUT"
+      - if: steps.check.outputs.newest == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          persist-credentials: false
+      # The app shows the commit as its version (Overview, My settings > About) and
+      # names its Sentry release after it (support-agent@<commit>).
+      - name: Build and push the image
+        if: steps.check.outputs.newest == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+          TAG: ${{ steps.tag.outputs.image }}
+        run: |
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker buildx create --use --driver docker-container >/dev/null
+          labels=(--label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY"
+            --label "org.opencontainers.image.revision=$SHA"
+            --label "org.opencontainers.image.licenses=Apache-2.0")
+          # The build reads the token as a secret, so it stays out of the image and the
+          # build arguments; the Dockerfile uploads the source maps when it is there.
+          sentry=()
+          if [ -n "$SENTRY_AUTH_TOKEN" ]; then
+            sentry=(--secret "id=sentry_auth_token,env=SENTRY_AUTH_TOKEN"
+              --build-arg "SENTRY_ORG=$SENTRY_ORG" --build-arg "SENTRY_PROJECT=$SENTRY_PROJECT")
+          else
+            echo "::notice::The secret SENTRY_AUTH_TOKEN is not set: the source maps are not uploaded to Sentry."
+          fi
+          docker buildx build . --push \
+            --tag "$TAG" --tag "$IMAGE:latest" \
+            --build-arg "APP_VERSION=${SHA:0:12}" \
+            "${labels[@]}" "${sentry[@]}" \
+            --cache-from "type=registry,ref=$IMAGE:buildcache" \
+            --cache-to "type=registry,ref=$IMAGE:buildcache,mode=max"
+
+  deploy:
+    name: Deploy to the server
+    needs: image
+    if: needs.image.outputs.image != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    permissions:
+      contents: read # main's newest commit
+      packages: read
+    steps:
+      # The server's deploy script (pt-infra, role team_app) pulls the image with this
+      # job's token (it expires with the job), writes the settings, runs the migrations,
+      # starts web and bot, waits until both are healthy, and puts the previous image
+      # back if they do not become healthy.
+      - name: Deploy to the server
+        env:
+          IMAGE_REF: ${{ needs.image.outputs.image }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+          DEPLOY_KNOWN_HOSTS: ${{ vars.DEPLOY_KNOWN_HOSTS }}
+          # The app's settings from the environment production. Empty ones are left
+          # out. A new setting needs a line here and in SETTINGS. Settings of the
+          # server (APP_URL, DATABASE_URL, POSTGRES_PASSWORD, TZ, TRUST_PROXY,
+          # ENCRYPTION_KEY, AUTH_SECRET) come from the server instead (docs/deployment.md).
+          SETTINGS: >-
+            OIDC_ISSUER OIDC_CLIENT_ID OIDC_CLIENT_SECRET OIDC_PROVIDER_NAME OIDC_SCOPES
+            OIDC_PKCE ADMIN_EMAILS APP_NAME BOT_WATCHDOG_SECONDS BOT_CONCURRENCY LOG_LEVEL
+            DATABASE_POOL_SIZE SENTRY_DSN SENTRY_ENVIRONMENT
+          OIDC_ISSUER: ${{ vars.OIDC_ISSUER }}
+          OIDC_CLIENT_ID: ${{ vars.OIDC_CLIENT_ID }}
+          OIDC_CLIENT_SECRET: ${{ secrets.OIDC_CLIENT_SECRET }}
+          OIDC_PROVIDER_NAME: ${{ vars.OIDC_PROVIDER_NAME }}
+          OIDC_SCOPES: ${{ vars.OIDC_SCOPES }}
+          OIDC_PKCE: ${{ vars.OIDC_PKCE }}
+          ADMIN_EMAILS: ${{ vars.ADMIN_EMAILS }}
+          APP_NAME: ${{ vars.APP_NAME }}
+          BOT_WATCHDOG_SECONDS: ${{ vars.BOT_WATCHDOG_SECONDS }}
+          BOT_CONCURRENCY: ${{ vars.BOT_CONCURRENCY }}
+          LOG_LEVEL: ${{ vars.LOG_LEVEL }}
+          DATABASE_POOL_SIZE: ${{ vars.DATABASE_POOL_SIZE }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          SENTRY_ENVIRONMENT: ${{ vars.SENTRY_ENVIRONMENT }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ]; then
+            echo "::notice::The environment production has no DEPLOY_HOST yet: built $IMAGE_REF, deployed nothing."
+            exit 0
+          fi
+          # Again here: a rerun of this job must not put an older image back.
+          newest=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "${IMAGE_REF##*:sha-}" != "$newest" ]; then
+            echo "::notice::$IMAGE_REF is no longer the newest commit on main ($newest): deployed nothing."
+            exit 0
+          fi
+          install -d -m 700 ~/.ssh
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy)
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          jq -n --arg image "$IMAGE_REF" --arg token "$TOKEN" '
+            ($ENV.SETTINGS | [splits("\\s+")] | map(select(. != ""))) as $names
+            | {image: $image, token: $token,
+               settings: ($ENV | with_entries(select(.key as $k | $names | index($k)) | select(.value != "")))}' \
+          | ssh -T -i ~/.ssh/deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "deploy@$DEPLOY_HOST"

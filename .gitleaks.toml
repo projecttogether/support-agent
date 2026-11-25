@@ -1,0 +1,18 @@
+# Gitleaks (the CI job "Secrets in the history"): its default rules, without
+# the invented values of this repository. Each is an example or test value,
+# never valid where the app is in use (config.ts refuses the examples).
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Example and test values"
+regexes = [
+  # The development ENCRYPTION_KEY and AUTH_SECRET (.env.example, config.ts, config.test.ts).
+  '''^ZGV2ZWxvcG1lbnQta2V5LWRldmVsb3BtZW50LWtleSE=$''',
+  '''^development-secret-development-secret$''',
+  # The CI job's ENCRYPTION_KEY (.github/workflows/ci.yaml).
+  '''^Y2ktb25seS1ub3QtYS1zZWNyZXQta2V5LTAwMDAwMDA=$''',
+  # Invented Slack app token and provider key of two tests (slack/web.test.ts, modules/api.int.test.ts).
+  '''^xapp-1-A1-1-test$''',
+  '''mistral-secret-key-1234''',
+]

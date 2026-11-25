@@ -1,0 +1,76 @@
+{
+  "realm": "support-agent",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "clients": [
+    {
+      "clientId": "support-agent",
+      "name": "Support Agent (development)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "clientAuthenticatorType": "client-secret",
+      "secret": "support-agent-dev-client-secret",
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "redirectUris": [
+        "http://localhost:3000/api/auth/callback/oidc",
+        "http://localhost:5173/api/auth/callback/oidc"
+      ],
+      "webOrigins": ["http://localhost:3000", "http://localhost:5173"],
+      "attributes": {
+        "pkce.code.challenge.method": "S256"
+      }
+    }
+  ],
+  "users": [
+    {
+      "username": "ada",
+      "enabled": true,
+      "email": "ada@example.org",
+      "emailVerified": true,
+      "firstName": "Ada",
+      "lastName": "Admin",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "support-agent-dev",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "eddie",
+      "enabled": true,
+      "email": "eddie@example.org",
+      "emailVerified": true,
+      "firstName": "Eddie",
+      "lastName": "Editor",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "support-agent-dev",
+          "temporary": false
+        }
+      ]
+    },
+    {
+      "username": "olga",
+      "enabled": true,
+      "email": "olga@example.org",
+      "emailVerified": true,
+      "firstName": "Olga",
+      "lastName": "Outsider",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "support-agent-dev",
+          "temporary": false
+        }
+      ]
+    }
+  ]
+}

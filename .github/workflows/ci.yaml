@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "26.13.0"
+
+jobs:
+  secrets:
+    name: Secrets in the history
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The CLI needs no license key or provider credentials.
+      - name: Install the pinned Gitleaks CLI
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            --output gitleaks.tar.gz
+          echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum --check
+          tar -xzf gitleaks.tar.gz gitleaks
+      # Every commit of the history, merge commits too, without showing what matched
+      # (.gitleaks.toml lists the repository's invented values).
+      - name: Scan the history
+        run: '"${{ runner.temp }}/gitleaks" git . --log-opts="--diff-merges=first-parent HEAD" --redact=100 --no-banner'
+
+  checks:
+    name: Lint, types, unit tests, build, audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - name: Check public repository contents
+        run: node scripts/check-public-repository.mjs
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+      - run: npm run format:check
+      - run: npm run typecheck
+      - run: npm test
+      - name: Migrations match the schema
+        run: |
+          npm run db:generate -- --name ci-check
+          if [ -n "$(git status --porcelain apps/server/drizzle)" ]; then
+            git status --porcelain apps/server/drizzle
+            echo "The schema in apps/server/src/db/schema has changes without a migration. Run: npm run db:generate"
+            exit 1
+          fi
+      - run: npm run build
+      # High and critical advisories in the production dependencies fail CI.
+      # Those without a fix that do not affect the app are listed, with a
+      # date, in the script.
+      - run: node scripts/audit.mjs
+
+  integration:
+    name: Integration tests (PostgreSQL 18)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: support_agent
+          POSTGRES_PASSWORD: support_agent
+          POSTGRES_DB: support_agent
+        ports: ["55436:5432"]
+        options: >-
+          --health-cmd "pg_isready -U support_agent -d support_agent"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test:integration
+
+  image:
+    name: Docker image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPOSE_FILE: compose.yaml:compose.postgres.yaml
+      COMPOSE_PROJECT_NAME: support-agent-ci-${{ github.run_id }}-${{ github.run_attempt }}
+      # The image built here, under the name compose.yaml runs, and fake settings.
+      SUPPORT_AGENT_IMAGE_TAG: ci
+      POSTGRES_PASSWORD: ci-only-password
+      DATABASE_URL: postgres://support_agent:ci-only-password@postgres:5432/support_agent
+      APP_URL: http://localhost:3000
+      AUTH_SECRET: ci-only-not-a-secret-ci-only-not-a-secret
+      ENCRYPTION_KEY: Y2ktb25seS1ub3QtYS1zZWNyZXQta2V5LTAwMDAwMDA=
+      OIDC_ISSUER: https://sso.example.invalid/realms/support-agent
+      OIDC_CLIENT_ID: support-agent
+      OIDC_CLIENT_SECRET: ci-only
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: docker build -t ghcr.io/projecttogether/support-agent:ci --build-arg APP_VERSION=ci .
+      - name: The image runs as a non-root user
+        run: test "$(docker run --rm --entrypoint id ghcr.io/projecttogether/support-agent:ci -u)" = "1000"
+      - name: The image has the operator command
+        run: |
+          docker run --rm ghcr.io/projecttogether/support-agent:ci cli help | grep -q "cli settings apply"
+          docker run --rm --entrypoint cli ghcr.io/projecttogether/support-agent:ci help | grep -q "cli settings apply"
+      - name: compose.yaml starts the migration, web and bot
+        run: |
+          docker compose up -d --wait --wait-timeout 180 web bot
+          docker compose exec -T web node -e "fetch('http://127.0.0.1:3000/-/readyz').then((r) => process.exit(r.ok ? 0 : 1))"
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Remove CI containers and volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans

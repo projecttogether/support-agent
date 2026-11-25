@@ -1,0 +1,2 @@
+ALTER TABLE "agents" ADD COLUMN "headline_threads" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "agents" ADD COLUMN "headline_message" text DEFAULT 'Please write your whole request in one message next time, so I can help right away. For now, I''ll read your reply in this thread.' NOT NULL;
