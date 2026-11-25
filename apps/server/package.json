@@ -1,0 +1,41 @@
+{
+  "name": "@support-agent/server",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --env-file-if-exists=../../.env.local --clear-screen=false src/main.ts",
+    "bot": "APP_ROLE=bot tsx --env-file-if-exists=../../.env.local src/main.ts",
+    "build": "node scripts/build.mjs && node ../../scripts/inject-debug-ids.mjs dist",
+    "start": "node dist/main.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "db:generate": "drizzle-kit generate",
+    "db:migrate": "APP_ROLE=migrate tsx --env-file-if-exists=../../.env.local src/main.ts",
+    "cli": "tsx --env-file-if-exists=../../.env.local src/cli.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "1.8.0",
+    "@hono/node-server": "2.1.8",
+    "@slack/socket-mode": "3.2.0",
+    "@slack/web-api": "8.4.0",
+    "@support-agent/shared": "*",
+    "better-auth": "1.7.23",
+    "drizzle-orm": "0.45.4",
+    "hono": "4.13.18",
+    "openai": "7.56.0",
+    "pg": "8.23.1",
+    "pino": "10.4.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@sentry/node": "11.12.0",
+    "@types/pg": "8.23.1",
+    "drizzle-kit": "0.31.11",
+    "esbuild": "0.28.2",
+    "pino-pretty": "13.2.0",
+    "tsx": "4.23.15",
+    "vitest": "5.1.0"
+  }
+}
