@@ -67,6 +67,8 @@ export class Bot {
   private readonly delayed = new Set<NodeJS.Timeout>();
   /** Whether the exchanges that bot processes before this one left unfinished were taken up. */
   private resumed = false;
+  /** Exchanges this process took up again (resumeInterrupted): a later look skips them. */
+  private readonly resuming = new Set<string>();
   /** The database's time when this process started: what it takes on is recorded later. */
   private takesOnFrom = new Date();
   private stopping = false;
@@ -244,9 +246,15 @@ export class Bot {
       this.resumed = true;
       const interrupted = await findInterrupted(getDb(), this.takesOnFrom);
       for (const exchange of interrupted) {
-        void resumeExchange(this.deps(port), exchange).catch((error: unknown) =>
-          logger.warn({ err: error }, "could not resume a message"),
-        );
+        if (this.resuming.has(exchange.id)) continue;
+        this.resuming.add(exchange.id);
+        void resumeExchange(this.deps(port), exchange).catch((error: unknown) => {
+          // A passing failure (Slack, the database): the next heartbeat looks again,
+          // and takes up only what is still pending and not taken up already.
+          this.resuming.delete(exchange.id);
+          this.resumed = false;
+          logger.warn({ err: error }, "could not resume a message");
+        });
       }
     } catch (error) {
       this.resumed = false;
